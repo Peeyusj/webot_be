@@ -5,6 +5,10 @@ import asyncio
 # FastAPI defaults to ProactorEventLoop on Windows which breaks subprocess spawning
 if sys.platform == "win32":
     asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
+
+    # Add this line temporarily
+print(f"🔧 Event loop policy: {type(asyncio.get_event_loop_policy()).__name__}")
+
 import os
 import hashlib
 import json
