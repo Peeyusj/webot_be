@@ -1,8 +1,10 @@
 import sys
 import asyncio
 
+# This MUST be set before creating any event loop
 if sys.platform == "win32":
-    asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
+    # CORRECT — what Playwright actually needs
+    asyncio.set_event_loop_policy(asyncio.WindowsProactorEventLoopPolicy())
 
 from crawl4ai import AsyncWebCrawler
 
@@ -22,15 +24,12 @@ async def test():
             print(f"✅ Success")
             print(f"Title: {result.metadata.get('title', 'No title')}")
             print(f"Word count: {len(result.markdown.split())}")
-            print(f"\nFirst 500 characters of content:")
+            print(f"\nFirst 500 characters:")
             print("-" * 50)
             print(result.markdown[:500])
         else:
-            print(f"❌ Failed")
+            print(f"❌ Failed: {result.error_message}")
 
-loop = asyncio.new_event_loop()
-asyncio.set_event_loop(loop)
-try:
-    loop.run_until_complete(test())
-finally:
-    loop.close()
+# Use asyncio.run() NOT manual loop creation
+# asyncio.run() respects the policy set above
+asyncio.run(test())
