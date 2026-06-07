@@ -36,3 +36,5 @@ Thumbs.db
 # Sentence-Transformers / HuggingFace local caches (if any get created)
 .chunks/
 .cache/
+# ChromaDB local storage
+chroma_db/
