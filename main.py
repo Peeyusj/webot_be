@@ -11,7 +11,7 @@ import hashlib
 import json
 import time
 from typing import List, Optional
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Header, Depends
 from fastapi.responses import StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
@@ -42,17 +42,71 @@ db_client = chromadb.PersistentClient(path="./chroma_db")
 collection = db_client.get_or_create_collection(name="webot_pages")
 print("✅ ChromaDB connected!")
 
-# --- GROQ CLIENT ---
-GROQ_API_KEY = os.getenv("GROQ_API_KEY")
-if not GROQ_API_KEY:
-    raise ValueError("❌ GROQ_API_KEY missing from .env file!")
+# ============================================================
+# LLM PROVIDERS — BRING YOUR OWN KEY (BYOK)
+# ============================================================
+# The user's AI API key is supplied by the extension on every
+# request via headers (X-Provider / X-Api-Key / X-Model). We use
+# it to build a transient client for that single request and then
+# discard it — the key is never persisted to disk or logged here.
+#
+# The client only sends an allow-listed *provider id* (not a raw
+# base_url), so we stay in control of where keys are ever sent.
+PROVIDERS = {
+    "groq": {
+        "label": "Groq",
+        "base_url": "https://api.groq.com/openai/v1",
+        "default_model": "llama-3.3-70b-versatile",
+    },
+    "openai": {
+        "label": "OpenAI",
+        "base_url": "https://api.openai.com/v1",
+        "default_model": "gpt-4o-mini",
+    },
+    "openrouter": {
+        "label": "OpenRouter",
+        "base_url": "https://openrouter.ai/api/v1",
+        "default_model": "meta-llama/llama-3.3-70b-instruct",
+    },
+}
 
-# Using Llama 3.3 70B Versatile for strict RAG
-groq_client = OpenAI(
-    api_key=GROQ_API_KEY,
-    base_url="https://api.groq.com/openai/v1"
-)
-print("✅ Groq connected!")
+# Optional server-side fallback so local dev keeps working without
+# configuring a key in the UI. A key sent from the UI always wins.
+FALLBACK_API_KEY = os.getenv("GROQ_API_KEY")
+FALLBACK_PROVIDER = "groq"
+if FALLBACK_API_KEY:
+    print("✅ Server fallback key detected (used only when no BYOK key is sent).")
+else:
+    print("ℹ️  No server fallback key — every request must carry a user API key.")
+
+
+def make_client(provider_id: Optional[str], api_key: str, model: Optional[str] = None):
+    """Builds an OpenAI-compatible client for an allow-listed provider."""
+    provider = PROVIDERS.get((provider_id or "").strip().lower()) or PROVIDERS[FALLBACK_PROVIDER]
+    chosen_model = (model or "").strip() or provider["default_model"]
+    client = OpenAI(api_key=api_key, base_url=provider["base_url"])
+    return client, chosen_model
+
+
+def resolve_llm(
+    x_provider: Optional[str] = Header(default=None),
+    x_api_key: Optional[str] = Header(default=None),
+    x_model: Optional[str] = Header(default=None),
+):
+    """FastAPI dependency: build the per-request LLM client from BYOK headers.
+
+    Falls back to the server env key only when the client sends none.
+    Raises 401 (with a UI-friendly message) when no usable key exists.
+    """
+    api_key = (x_api_key or "").strip()
+    if api_key:
+        return make_client(x_provider, api_key, x_model)
+    if FALLBACK_API_KEY:
+        return make_client(FALLBACK_PROVIDER, FALLBACK_API_KEY, None)
+    raise HTTPException(
+        status_code=401,
+        detail="No AI API key configured. Open Settings and add your key.",
+    )
 
 # --- CONSTANTS ---
 SITEMAP_MAX_URLS = 40  # Broad cap if sitemap is cleanly provided
@@ -92,6 +146,9 @@ class QueryData(BaseModel):
 class ClearCacheRequest(BaseModel):
     url: str
     clear_all: bool = False
+
+class SuggestRequest(BaseModel):
+    url: str
 
 
 # ============================================================
@@ -182,7 +239,7 @@ async def fetch_sitemap_urls(domain_root: str, scope_prefix: str) -> List[str]:
 # RAG ROUTING
 # ============================================================
 
-def route_question_intent(question: str) -> str:
+def route_question_intent(question: str, client: OpenAI, model: str) -> str:
     system_prompt = """Categorize the user's question into ONE intent:
 "SPECIFIC" - explicit facts, code snippets, or precise details
 "GLOBAL"   - summaries, overviews, main themes, or broad concepts
@@ -191,8 +248,8 @@ def route_question_intent(question: str) -> str:
 Respond ONLY with valid JSON: {"intent": "SPECIFIC"}"""
 
     try:
-        response = groq_client.chat.completions.create(
-            model="llama-3.3-70b-versatile",
+        response = client.chat.completions.create(
+            model=model,
             messages=[
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": question}
@@ -215,6 +272,43 @@ Respond ONLY with valid JSON: {"intent": "SPECIFIC"}"""
 @app.get("/health")
 def health_check():
     return {"status": "healthy"}
+
+@app.get("/providers")
+def list_providers():
+    """Public metadata for the Settings UI (labels + default models). No keys."""
+    return {
+        "providers": [
+            {"id": pid, "label": p["label"], "default_model": p["default_model"]}
+            for pid, p in PROVIDERS.items()
+        ]
+    }
+
+@app.post("/validate-key")
+def validate_key(
+    x_provider: Optional[str] = Header(default=None),
+    x_api_key: Optional[str] = Header(default=None),
+    x_model: Optional[str] = Header(default=None),
+):
+    """Lets the Settings UI verify a key with a tiny live request.
+
+    Unlike the other endpoints this never falls back to the server key —
+    it tests exactly what the user typed.
+    """
+    api_key = (x_api_key or "").strip()
+    if not api_key:
+        return {"valid": False, "detail": "API key is required."}
+
+    client, model = make_client(x_provider, api_key, x_model)
+    try:
+        client.chat.completions.create(
+            model=model,
+            messages=[{"role": "user", "content": "ping"}],
+            max_tokens=1,
+            temperature=0.0,
+        )
+        return {"valid": True, "model": model}
+    except Exception as e:
+        return {"valid": False, "model": model, "detail": str(e)[:300]}
 
 @app.post("/clear-cache")
 async def clear_cache(data: ClearCacheRequest):
@@ -456,24 +550,80 @@ async def ingest_site(data: SiteIngestRequest):
     
     return StreamingResponse(site_ingestion_generator(), media_type="text/event-stream")
 
-@app.post("/ask-stream")
-async def ask_question_stream(data: QueryData):
+@app.post("/suggest-question")
+def suggest_question(data: SuggestRequest, llm=Depends(resolve_llm)):
+    """Generates ONE short starter question from the indexed content.
+
+    Works for both single-page and full-site scopes — it picks whichever
+    is indexed for this URL (site takes precedence), samples a few chunks,
+    and asks the model for a single guiding question.
+    """
+    client, model = llm
     try:
         url_hash = get_url_hash(data.url)
         scope_prefix = get_scope_prefix(data.url)
         site_hash = get_url_hash(scope_prefix)
-        
+
         site_indexed = collection.get(where={"url_hash": site_hash}, limit=1)
         active_hash = site_hash if (site_indexed and site_indexed.get("ids")) else url_hash
-        
-        intent = await asyncio.get_event_loop().run_in_executor(None, route_question_intent, data.question)
+
+        sample = collection.get(where={"url_hash": active_hash}, limit=5)
+        docs = sample.get("documents") or []
+        metas = sample.get("metadatas") or []
+        if not docs:
+            return {"question": ""}
+
+        title = (metas[0].get("title", "") if metas else "").strip()
+        context = "\n---\n".join(docs[:5])[:4000]
+
+        response = client.chat.completions.create(
+            model=model,
+            messages=[
+                {
+                    "role": "system",
+                    "content": (
+                        "You write ONE short, specific question a curious reader might "
+                        "ask about the given web content, to help them start exploring it. "
+                        "Reply with ONLY the question text — no quotes, no preamble, "
+                        "max 12 words."
+                    ),
+                },
+                {
+                    "role": "user",
+                    "content": f"Title: {title}\n\nContent:\n{context}\n\nWrite one helpful starter question.",
+                },
+            ],
+            temperature=0.4,
+            max_tokens=40,
+        )
+        question = (response.choices[0].message.content or "").strip().strip('"').strip()
+        return {"question": question}
+
+    except Exception as e:
+        print(f"⚠️  [SUGGEST ERROR]: {str(e)}")
+        return {"question": ""}
+
+@app.post("/ask-stream")
+async def ask_question_stream(data: QueryData, llm=Depends(resolve_llm)):
+    client, model = llm
+    try:
+        url_hash = get_url_hash(data.url)
+        scope_prefix = get_scope_prefix(data.url)
+        site_hash = get_url_hash(scope_prefix)
+
+        site_indexed = collection.get(where={"url_hash": site_hash}, limit=1)
+        active_hash = site_hash if (site_indexed and site_indexed.get("ids")) else url_hash
+
+        intent = await asyncio.get_event_loop().run_in_executor(
+            None, route_question_intent, data.question, client, model
+        )
         
         # --- CASUAL CHAT BYPASS ---
         if intent == "CHAT":
             async def chat_generator():
                 yield f"data: {json.dumps({'type': 'sources', 'sources': []})}\n\n"
-                response_stream = groq_client.chat.completions.create(
-                    model="llama-3.3-70b-versatile",
+                response_stream = client.chat.completions.create(
+                    model=model,
                     messages=[
                         {"role": "system", "content": "You are a friendly AI assistant. Respond warmly and concisely to the user's greeting or pleasantry."},
                         {"role": "user", "content": data.question}
@@ -538,9 +688,9 @@ async def ask_question_stream(data: QueryData):
         
         def stream_tokens():
             yield f"data: {json.dumps({'type': 'sources', 'sources': sources_payload})}\n\n"
-            
-            response_stream = groq_client.chat.completions.create(
-                model="llama-3.3-70b-versatile",
+
+            response_stream = client.chat.completions.create(
+                model=model,
                 messages=groq_messages,
                 stream=True,
                 temperature=0.0
